@@ -29,35 +29,52 @@ c := puppetdb.NewClient("https://puppetdb.example:8081", puppetdb.WithToken(toke
 rows, _ = c.Query(context.Background(), `nodes{ facts.os.family = "RedHat" }`)
 ```
 
-## Supported (v1)
+## Supported
 
 | Area | Detail |
 |------|--------|
-| Entities | `nodes`, `resources`, `facts`, `inventory`, `catalogs`, `reports`, `events`, `edges`, `fact_contents` |
+| Entities | `nodes`, `resources`, `facts`, `inventory`, `catalogs`, `reports`, `events`, `edges`, `fact_contents`, `fact_paths`, `factsets`, `environments`, `packages`, `package_inventory` |
 | Comparison | `=` `!=` `<` `>` `<=` `>=` |
-| Regexp | `~` (match), `!~` (non-match) |
+| Regexp | `~` (match), `!~` (non-match), `~>` (regexp-array match) |
 | Boolean | `and`, `or`, `not`, grouping with `(` `)` |
 | Membership | `in` against an array literal `[...]` or a subquery `entity[proj]{...}` |
+| Subqueries | explicit `in`/`from`, implicit `entity { ... }`, and the legacy `select_<entity>` spelling (all accepted; compiled to the canonical form) |
 | Null tests | `is null`, `is not null` |
-| Projection | extract field lists `entity[field, field]{...}`, dotted paths `facts.os.family` |
-| Modifiers | `order by ... [asc\|desc]`, `limit`, `offset` |
-| Literals | strings (with `\" \\ \n \t \r` escapes), integers, floats (incl. negative), `true`, `false`, `null` |
-| Compilation | PQL AST → `["from", entity, ["and", ["=", "field", "x"], ...]]` JSON |
-| Evaluation | in-memory store with recursive subquery evaluation, ordering, paging, projection |
+| Projection | extract lists `entity[field, count()]{...}`, dotted paths `facts.os.family`, aggregate/transform **functions** `count()`, `count(field)`, `avg`, `sum`, `min`, `max`, `to_string(field, fmt)` |
+| Grouping | **`group by`** (fields or functions), accepted both inside the braces (PQL grammar) and, as a superset, after them |
+| Modifiers | `order by ... [asc\|desc]`, `limit`, `offset` — inside or after the braces |
+| Literals | strings — both `"double"` (with `\" \\ \n \t \r`) and `'single'` (with `\'`) — integers, floats incl. negative and **scientific notation** (`1.5e3`, `2E-4`), `true`, `false`, `null` |
+| Fields | dotted deep paths and a trailing `?` (e.g. `deactivated?`) |
+| Compilation | PQL → canonical AST-query JSON: `["from", entity, ["extract", [cols…], filter, ["group_by", …]], …]`, `["function", name, args…]`, `["~>", …]`, `["subquery", …]` |
+| Evaluation | in-memory store: filter, recursive `in`-subquery evaluation, `group by` + `count/avg/sum/min/max` aggregation, `~>` array matching, ordering, paging, projection |
 | Client | POST PQL or compiled AST to `/pdb/query/v4`; token auth; injectable transport |
 
-## Deferred (not in v1, documented — not silently capped)
+The parser accepts every construct of PuppetDB's PQL grammar
+(`pql-grammar.ebnf`) and compiles to the exact AST-query JSON PuppetDB's own
+`transform.clj` produces (asserted by the differential tests).
+
+## Not evaluated in-memory (compiled to AST for the server; client + eval only)
+
+These parse and compile to the correct AST-query JSON (so the `Client` sends
+them to a real PuppetDB), but the in-memory `Store` returns a clear error rather
+than guessing:
+
+- **`to_string(field, fmt)`** — requires PostgreSQL `to_char` date/number
+  formatting.
+- **Implicit subqueries** `entity { ... }` — require PuppetDB's entity join
+  graph. Use the explicit `field in entity[field]{ ... }` form for in-memory
+  evaluation.
+
+## Out of scope (documented — not silently capped)
 
 - **A PuppetDB storage server.** This library queries; it does not persist,
   index or serve. There is no on-disk store and no command/ingest endpoint.
 - **Importing a live PuppetDB's data** into the in-memory store (no sync/replay
   helpers yet — you populate `Store` yourself).
-- **Aggregate / function projections**: `count()`, `avg()`, `group by`,
-  `extract`-with-function and the `[...]` capture-group projections of PQL.
-- **`~>` / dotted regexp array paths** on `fact_contents` `path`, and the
-  `select_<entity>` legacy subquery spellings (the modern `in`/`from` forms are
-  supported).
-- **Structured-fact deep querying operators** beyond dotted-path equality.
+- **Regexp capture-group projections** — not a PQL construct (PQL projects
+  fields and functions only), so nothing to implement.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the parse/compile/eval baselines.
 
 ## Development
 

@@ -110,12 +110,19 @@ func (l *lexer) next() (token, error) {
 		l.pos++
 		return token{kind: tDot, text: ".", pos: start}, nil
 	case c == '"':
-		return l.lexString()
+		return l.lexString('"')
+	case c == '\'':
+		return l.lexString('\'')
 	case c == '=':
 		l.pos++
 		return token{kind: tOp, text: "=", pos: start}, nil
 	case c == '~':
 		l.pos++
+		// '~>' is the regexp-array match operator; '~' the scalar one.
+		if l.pos < len(l.src) && l.src[l.pos] == '>' {
+			l.pos++
+			return token{kind: tOp, text: "~>", pos: start}, nil
+		}
 		return token{kind: tOp, text: "~", pos: start}, nil
 	case c == '!':
 		return l.lexBang()
@@ -155,18 +162,23 @@ func (l *lexer) lexRelational(c byte) token {
 	return token{kind: tOp, text: string(c), pos: start}
 }
 
-// lexIdent scans an identifier.
+// lexIdent scans an identifier. A single trailing '?' is permitted (PQL fields
+// may end in '?', e.g. a boolean fact name).
 func (l *lexer) lexIdent() token {
 	start := l.pos
 	l.pos++
 	for l.pos < len(l.src) && isIdentPart(l.src[l.pos]) {
 		l.pos++
 	}
+	if l.pos < len(l.src) && l.src[l.pos] == '?' {
+		l.pos++
+	}
 	return token{kind: tIdent, text: l.src[start:l.pos], pos: start}
 }
 
 // lexNumber scans an integer or floating-point literal, with an optional
-// leading '-' sign.
+// leading '-' sign and an optional scientific-notation exponent
+// ('e'/'E' with an optional sign), e.g. -3.5, 1.5e3, 2E-4.
 func (l *lexer) lexNumber() (token, error) {
 	start := l.pos
 	if l.src[l.pos] == '-' {
@@ -187,36 +199,50 @@ func (l *lexer) lexNumber() (token, error) {
 			l.pos++
 		}
 	}
+	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
+		if err := l.lexExponent(start); err != nil {
+			return token{}, err
+		}
+	}
 	return token{kind: tNumber, text: l.src[start:l.pos], pos: start}, nil
 }
 
-// lexString scans a double-quoted string literal, honouring the escapes
-// \" \\ \n \t \r; any other escaped byte is kept verbatim.
-func (l *lexer) lexString() (token, error) {
+// lexExponent scans the exponent tail of a scientific-notation number: an
+// 'e'/'E', an optional '+'/'-' sign, then at least one digit.
+func (l *lexer) lexExponent(start int) error {
+	l.pos++ // consume 'e' / 'E'
+	if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
+		l.pos++
+	}
+	if l.pos >= len(l.src) || !isDigit(l.src[l.pos]) {
+		return fmt.Errorf("puppetdb: lex: malformed exponent at offset %d", start)
+	}
+	for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+		l.pos++
+	}
+	return nil
+}
+
+// lexString scans a string literal delimited by quote. A double-quoted string
+// honours the escapes \" \\ \n \t \r (any other escaped byte is kept verbatim),
+// matching PuppetDB's JSON-style decoding. A single-quoted string is literal
+// except for the \' escape, matching PuppetDB's sqstring handling.
+func (l *lexer) lexString(quote byte) (token, error) {
 	start := l.pos
 	l.pos++ // opening quote
 	var b strings.Builder
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
-		switch c {
-		case '"':
+		switch {
+		case c == quote:
 			l.pos++
 			return token{kind: tString, text: b.String(), pos: start}, nil
-		case '\\':
+		case c == '\\':
 			l.pos++
 			if l.pos >= len(l.src) {
 				return token{}, fmt.Errorf("puppetdb: lex: unterminated string at offset %d", start)
 			}
-			switch l.src[l.pos] {
-			case 'n':
-				b.WriteByte('\n')
-			case 't':
-				b.WriteByte('\t')
-			case 'r':
-				b.WriteByte('\r')
-			default:
-				b.WriteByte(l.src[l.pos])
-			}
+			writeEscape(&b, quote, l.src[l.pos])
 			l.pos++
 		default:
 			b.WriteByte(c)
@@ -224,4 +250,29 @@ func (l *lexer) lexString() (token, error) {
 		}
 	}
 	return token{}, fmt.Errorf("puppetdb: lex: unterminated string at offset %d", start)
+}
+
+// writeEscape decodes the byte following a backslash into b. Within a
+// single-quoted string only \' collapses to '; every other escape keeps the
+// backslash and the byte verbatim (matching PuppetDB's sqstring). Within a
+// double-quoted string the JSON-style \n \t \r escapes decode and any other
+// escaped byte is kept verbatim.
+func writeEscape(b *strings.Builder, quote, c byte) {
+	if quote == '\'' {
+		if c != '\'' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+		return
+	}
+	switch c {
+	case 'n':
+		b.WriteByte('\n')
+	case 't':
+		b.WriteByte('\t')
+	case 'r':
+		b.WriteByte('\r')
+	default:
+		b.WriteByte(c)
+	}
 }

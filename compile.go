@@ -10,15 +10,33 @@ import (
 )
 
 // AST compiles the query into PuppetDB's canonical AST-query value, ready to be
-// JSON-encoded. The shape is ["from", <entity>, <inner>, <modifiers>...] where
-// <inner> is an ["extract", ...] node when a projection is present, otherwise
-// the bare filter clause (omitted entirely when there is no filter).
+// JSON-encoded. The shape is ["from", <entity>, <inner>, <modifiers>...]. When a
+// projection is present the <inner> is an ["extract", <cols>, <filter?>,
+// <group_by?>] node (the group_by, per PuppetDB, is the last argument of an
+// extract); otherwise the bare filter and/or group_by clauses appear directly.
 func (q *Query) AST() any {
 	out := []any{"from", q.Entity}
 
-	if inner := compileInner(q); inner != nil {
-		out = append(out, inner)
+	filter := compileExpr(q.Filter)
+	groupBy := compileGroupBy(q.GroupBy)
+	if len(q.Projection) > 0 {
+		extract := []any{"extract", compileProjList(q.Projection)}
+		if filter != nil {
+			extract = append(extract, filter)
+		}
+		if groupBy != nil {
+			extract = append(extract, groupBy)
+		}
+		out = append(out, extract)
+	} else {
+		if filter != nil {
+			out = append(out, filter)
+		}
+		if groupBy != nil {
+			out = append(out, groupBy)
+		}
 	}
+
 	if len(q.OrderBy) > 0 {
 		terms := make([]any, 0, len(q.OrderBy))
 		for _, t := range q.OrderBy {
@@ -39,21 +57,48 @@ func (q *Query) AST() any {
 	return out
 }
 
-// compileInner builds the extract-or-filter node of a query, or nil when the
-// query has neither a projection nor a filter.
-func compileInner(q *Query) any {
-	filter := compileExpr(q.Filter)
-	if len(q.Projection) > 0 {
-		proj := make([]any, len(q.Projection))
-		for i, f := range q.Projection {
-			proj[i] = f
-		}
-		if filter == nil {
-			return []any{"extract", proj}
-		}
-		return []any{"extract", proj, filter}
+// compileProjList compiles an extract list to its JSON columns array, mapping
+// plain fields to strings and functions to ["function", name, args...] nodes.
+func compileProjList(items []ProjItem) []any {
+	out := make([]any, len(items))
+	for i, it := range items {
+		out[i] = it.compile()
 	}
-	return filter
+	return out
+}
+
+// compileGroupBy compiles a group-by list to a ["group_by", item...] node, or
+// nil when there is no grouping.
+func compileGroupBy(items []ProjItem) any {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(items)+1)
+	out = append(out, "group_by")
+	for _, it := range items {
+		out = append(out, it.compile())
+	}
+	return out
+}
+
+// compile maps a projection item to its JSON form: a bare field string or a
+// function node.
+func (it ProjItem) compile() any {
+	if it.Func != nil {
+		return it.Func.compile()
+	}
+	return it.Field
+}
+
+// compile maps a function to ["function", name, arg...]; each argument (a field
+// or a string literal) is emitted as a JSON string.
+func (f *Func) compile() any {
+	out := make([]any, 0, len(f.Args)+2)
+	out = append(out, "function", f.Name)
+	for _, a := range f.Args {
+		out = append(out, a.Text)
+	}
+	return out
 }
 
 // MarshalAST compiles the query and JSON-encodes it. The encoding of the
@@ -102,6 +147,24 @@ func (n Not) compileAST() any {
 // compileAST maps a null test to ["null?", field, <isNull>].
 func (n IsNull) compileAST() any {
 	return []any{"null?", n.Field, !n.Negate}
+}
+
+// compileAST maps a regexp-array test to ["~>", field, [pattern, ...]].
+func (r RegexpArray) compileAST() any {
+	pats := make([]any, len(r.Patterns))
+	for i, p := range r.Patterns {
+		pats[i] = p
+	}
+	return []any{"~>", r.Field, pats}
+}
+
+// compileAST maps an implicit subquery to ["subquery", entity, filter], or
+// ["subquery", entity] when the subquery has no filter.
+func (sq Subquery) compileAST() any {
+	if sq.Filter == nil {
+		return []any{"subquery", sq.Entity}
+	}
+	return []any{"subquery", sq.Entity, sq.Filter.compileAST()}
 }
 
 // compileAST maps a membership test to canonical form. A single field compiles
