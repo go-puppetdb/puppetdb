@@ -39,9 +39,38 @@ func (s *Store) Query(pql string) ([]Row, error) {
 	return s.Eval(q)
 }
 
-// Eval evaluates a parsed query against the store, applying the filter, then the
-// order-by / offset / limit modifiers, then the projection.
+// Eval evaluates a parsed query against the store. It applies the filter, then
+// either aggregates (when the query has a group-by clause or a function in its
+// projection) or projects the plain columns, and finally applies the order-by /
+// offset / limit modifiers.
 func (s *Store) Eval(q *Query) ([]Row, error) {
+	matched, err := s.filterRows(q)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []Row
+	if hasAggregation(q) {
+		out, err = aggregate(q, matched)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		out = matched
+	}
+
+	if len(q.OrderBy) > 0 {
+		orderRows(out, q.OrderBy)
+	}
+	out = applyPaging(out, q.Offset, q.Limit)
+	if !hasAggregation(q) {
+		out = applyProjection(out, q.Projection)
+	}
+	return out, nil
+}
+
+// filterRows returns the rows of the queried entity that satisfy the filter.
+func (s *Store) filterRows(q *Query) ([]Row, error) {
 	var matched []Row
 	for _, row := range s.entities[q.Entity] {
 		ok, err := matchFilter(s, q.Filter, row)
@@ -52,12 +81,21 @@ func (s *Store) Eval(q *Query) ([]Row, error) {
 			matched = append(matched, row)
 		}
 	}
+	return matched, nil
+}
 
-	if len(q.OrderBy) > 0 {
-		orderRows(matched, q.OrderBy)
+// hasAggregation reports whether the query aggregates: it has a group-by clause
+// or at least one function in its projection.
+func hasAggregation(q *Query) bool {
+	if len(q.GroupBy) > 0 {
+		return true
 	}
-	matched = applyPaging(matched, q.Offset, q.Limit)
-	return applyProjection(matched, q.Projection), nil
+	for _, it := range q.Projection {
+		if it.Func != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // matchFilter reports whether row satisfies expr; a nil expr matches everything.
@@ -100,17 +138,18 @@ func applyPaging(rows []Row, offset, limit *int) []Row {
 }
 
 // applyProjection reduces each row to the projected fields; an empty projection
-// returns the rows unchanged.
-func applyProjection(rows []Row, projection []string) []Row {
+// returns the rows unchanged. It is only reached on the non-aggregating path, so
+// every projection item is a plain field.
+func applyProjection(rows []Row, projection []ProjItem) []Row {
 	if len(projection) == 0 {
 		return rows
 	}
 	out := make([]Row, len(rows))
 	for i, row := range rows {
 		pr := Row{}
-		for _, f := range projection {
-			v, _ := digField(row, f)
-			pr[f] = v
+		for _, it := range projection {
+			v, _ := digField(row, it.Field)
+			pr[it.Field] = v
 		}
 		out[i] = pr
 	}
@@ -265,19 +304,72 @@ func (in In) evalMatch(s *Store, row Row) (bool, error) {
 // evalSubquery evaluates the subquery on the right of an in operator and tests
 // the left-hand tuple for membership in the projected rows.
 func (in In) evalSubquery(s *Store, lhs []any) (bool, error) {
+	cols, err := projFieldNames(in.Sub.Projection)
+	if err != nil {
+		return false, err
+	}
+	if len(in.Fields) != len(cols) {
+		return false, fmt.Errorf("puppetdb: eval: in arity mismatch: %d field(s) vs %d projected column(s)", len(in.Fields), len(cols))
+	}
 	rows, err := s.Eval(in.Sub)
 	if err != nil {
 		return false, err
 	}
-	if len(in.Fields) != len(in.Sub.Projection) {
-		return false, fmt.Errorf("puppetdb: eval: in arity mismatch: %d field(s) vs %d projected column(s)", len(in.Fields), len(in.Sub.Projection))
-	}
 	for _, r := range rows {
-		if tupleEqual(lhs, in.Sub.Projection, r) {
+		if tupleEqual(lhs, cols, r) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// projFieldNames returns the plain field names of a subquery projection,
+// erroring if any item is a function (which cannot serve as an in-membership
+// column).
+func projFieldNames(items []ProjItem) ([]string, error) {
+	cols := make([]string, len(items))
+	for i, it := range items {
+		if it.Func != nil {
+			return nil, fmt.Errorf("puppetdb: eval: a function projection cannot be used as an 'in' subquery column")
+		}
+		cols[i] = it.Field
+	}
+	return cols, nil
+}
+
+// evalMatch evaluates a regexp-array test: the field must be an array whose
+// elements each match the corresponding pattern, position by position.
+func (r RegexpArray) evalMatch(_ *Store, row Row) (bool, error) {
+	res := make([]*regexp.Regexp, len(r.Patterns))
+	for i, pat := range r.Patterns {
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			return false, fmt.Errorf("puppetdb: eval: invalid regexp %q: %w", pat, err)
+		}
+		res[i] = re
+	}
+	v, found := digField(row, r.Field)
+	if !found {
+		return false, nil
+	}
+	arr, ok := v.([]any)
+	if !ok || len(arr) != len(res) {
+		return false, nil
+	}
+	for i, re := range res {
+		s, ok := arr[i].(string)
+		if !ok || !re.MatchString(s) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// evalMatch reports that an implicit subquery cannot be evaluated in-memory:
+// resolving it requires PuppetDB's entity join graph. Use the explicit
+// "field in entity[field]{...}" form for in-memory evaluation.
+func (sq Subquery) evalMatch(_ *Store, _ Row) (bool, error) {
+	return false, fmt.Errorf("puppetdb: eval: implicit subquery on %q requires PuppetDB's join graph and is not evaluated in-memory; use the explicit \"field in %s[field]{...}\" form", sq.Entity, sq.Entity)
 }
 
 // tupleEqual reports whether the left-hand values equal the projected columns of

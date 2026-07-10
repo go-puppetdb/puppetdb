@@ -42,6 +42,38 @@ func TestLexAllTokens(t *testing.T) {
 	}
 }
 
+// TestLexNewTokens covers the ~> operator, scientific-notation numbers,
+// single-quoted strings (including the \' escape and a literal backslash), and
+// question-mark-terminated identifiers.
+func TestLexNewTokens(t *testing.T) {
+	cases := []struct {
+		src  string
+		kind tokenKind
+		text string
+	}{
+		{`~>`, tOp, "~>"},
+		{`1.5e3`, tNumber, "1.5e3"},
+		{`2E-4`, tNumber, "2E-4"},
+		{`3e2`, tNumber, "3e2"},
+		{`1.0e+2`, tNumber, "1.0e+2"},
+		{`'hi'`, tString, "hi"},
+		{`'it\'s'`, tString, "it's"},
+		{`'a\nb'`, tString, `a\nb`}, // single quotes keep a literal backslash-n
+		{`deactivated?`, tIdent, "deactivated?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.src, func(t *testing.T) {
+			toks, err := lex(tc.src)
+			if err != nil {
+				t.Fatalf("lex(%q): %v", tc.src, err)
+			}
+			if toks[0].kind != tc.kind || toks[0].text != tc.text {
+				t.Fatalf("lex(%q): got {%d,%q} want {%d,%q}", tc.src, toks[0].kind, toks[0].text, tc.kind, tc.text)
+			}
+		})
+	}
+}
+
 func TestLexErrors(t *testing.T) {
 	cases := map[string]string{
 		"unexpected char":     `@`,
@@ -53,6 +85,10 @@ func TestLexErrors(t *testing.T) {
 		"unterminated string": `"abc`,
 		"backslash at eof":    `"x\`,
 		"trailing after dot":  `1.x`,
+		"bad exponent":        `1.5e`,
+		"bad exponent sign":   `3e+`,
+		"unterminated sq":     `'abc`,
+		"sq backslash at eof": `'x\`,
 	}
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -57,6 +57,66 @@ func TestParseAndCompile(t *testing.T) {
 			`["from","nodes",["extract",["certname"],["=","a",1]],["offset",3]]`},
 		{"empty", `nodes{}`, `["from","nodes"]`},
 		{"negative number", `nodes{ a = -3.5 }`, `["from","nodes",["=","a",-3.5]]`},
+
+		// --- aggregate functions and group by ---
+		{"count only", `nodes[count()]{}`,
+			`["from","nodes",["extract",[["function","count"]]]]`},
+		{"count field", `facts[count(value)]{}`,
+			`["from","facts",["extract",[["function","count","value"]]]]`},
+		{"field and count group by", `facts[name, count()] { group by name }`,
+			`["from","facts",["extract",["name",["function","count"]],["group_by","name"]]]`},
+		{"count with filter and group by", `facts[name, count(value)] { certname ~ "^web" group by name }`,
+			`["from","facts",["extract",["name",["function","count","value"]],["~","certname","^web"],["group_by","name"]]]`},
+		{"avg sum min max", `facts[avg(value), sum(value), min(value), max(value)]{}`,
+			`["from","facts",["extract",[["function","avg","value"],["function","sum","value"],["function","min","value"],["function","max","value"]]]]`},
+		{"to_string function", `reports[count(), to_string(receive_time, "DAY")]{group by to_string(receive_time, "DAY")}`,
+			`["from","reports",["extract",[["function","count"],["function","to_string","receive_time","DAY"]],["group_by",["function","to_string","receive_time","DAY"]]]]`},
+		{"group by two fields", `resources[type, title, count()]{ group by type, title }`,
+			`["from","resources",["extract",["type","title",["function","count"]],["group_by","type","title"]]]`},
+		{"group by no extract", `facts{ group by name }`,
+			`["from","facts",["group_by","name"]]`},
+		{"group by outside braces", `facts[name, count()]{} group by name`,
+			`["from","facts",["extract",["name",["function","count"]],["group_by","name"]]]`},
+		{"group by with paging", `facts[name, count()]{ group by name } order by count desc limit 5`,
+			`["from","facts",["extract",["name",["function","count"]],["group_by","name"]],["order_by",[["count","desc"]]],["limit",5]]`},
+
+		// --- paging inside braces (real PQL grammar) ---
+		{"limit inside braces", `nodes[certname]{ limit 3 }`,
+			`["from","nodes",["extract",["certname"]],["limit",3]]`},
+		{"filter and paging inside", `nodes{ a = 1 order by a limit 2 offset 1 }`,
+			`["from","nodes",["=","a",1],["order_by",[["a","asc"]]],["limit",2],["offset",1]]`},
+
+		// --- legacy select_ subquery spelling ---
+		{"select_ subquery", `nodes{ certname in select_resources[certname]{ type = "Class" } }`,
+			`["from","nodes",["in","certname",["from","resources",["extract",["certname"],["=","type","Class"]]]]]`},
+
+		// --- implicit subqueries ---
+		{"implicit subquery", `nodes{ resources { type = "Class" } }`,
+			`["from","nodes",["subquery","resources",["=","type","Class"]]]`},
+		{"implicit subquery empty", `nodes{ resources {} }`,
+			`["from","nodes",["subquery","resources"]]`},
+		{"implicit subquery composed", `nodes{ certname ~ "^web" and resources { type = "Package" } }`,
+			`["from","nodes",["and",["~","certname","^web"],["subquery","resources",["=","type","Package"]]]]`},
+		{"entity-named field", `resources{ nodes = 1 }`,
+			`["from","resources",["=","nodes",1]]`},
+
+		// --- ~> regexp array ---
+		{"regexp array", `fact_contents{ path ~> ["networking", "eth0", ".*"] }`,
+			`["from","fact_contents",["~>","path",["networking","eth0",".*"]]]`},
+
+		// --- scientific notation and single quotes ---
+		{"sci notation positive", `nodes{ a = 1.5e3 }`, `["from","nodes",["=","a",1500]]`},
+		{"sci notation caps signed", `nodes{ a = 2E-4 }`, `["from","nodes",["=","a",0.0002]]`},
+		{"sci notation int mantissa", `nodes{ a = 3e2 }`, `["from","nodes",["=","a",300]]`},
+		{"sci notation plus", `nodes{ a = 1.0e+2 }`, `["from","nodes",["=","a",100]]`},
+		{"single-quoted string", `nodes{ a = 'hi there' }`, `["from","nodes",["=","a","hi there"]]`},
+		{"single-quoted escape", `nodes{ a = 'it\'s' }`, `["from","nodes",["=","a","it's"]]`},
+		{"question-mark field", `nodes{ deactivated? = true }`, `["from","nodes",["=","deactivated?",true]]`},
+
+		// --- additional entities ---
+		{"packages entity", `packages{}`, `["from","packages"]`},
+		{"factsets entity", `factsets{}`, `["from","factsets"]`},
+		{"empty projection", `nodes[]{}`, `["from","nodes"]`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -120,6 +180,28 @@ func TestParseErrors(t *testing.T) {
 		"offset err":           `nodes{} offset x`,
 		"trailing token":       `nodes{} foo`,
 		"literal at eof":       `nodes{ a =`,
+		// aggregate / function / clause errors
+		"func no rparen":        `nodes[count(a]{}`,
+		"func arg field err":    `nodes[count(.)]{}`,
+		"proj item field err":   `nodes[.]{}`,
+		"group by no by":        `facts[name]{ group name }`,
+		"group by field err":    `facts[name]{ group by . }`,
+		"limit inside not int":  `nodes{ limit x }`,
+		"offset inside not int": `nodes{ offset x }`,
+		"order inside err":      `nodes{ order x }`,
+		// select_ / subquery errors
+		"select unknown entity":   `nodes{ a in select_foo[a]{a=1} }`,
+		"implicit sub filter err": `nodes{ resources { bad } }`,
+		"implicit sub no rbrace":  `nodes{ resources { a = 1 `,
+		// ~> errors
+		"regexp array no bracket":  `nodes{ path ~> "x" }`,
+		"regexp array not string":  `nodes{ path ~> [1] }`,
+		"regexp array no rbracket": `nodes{ path ~> ["a" "b"] }`,
+		// scientific notation lexer error
+		"bad exponent":     `nodes{ a = 1.5e }`,
+		"bad exponent int": `nodes{ a = 3e+ }`,
+		// unterminated single quote
+		"unterminated sq": `nodes{ a = 'x }`,
 	}
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {
