@@ -18,6 +18,9 @@ type Row map[string]any
 // queries can be evaluated without a PuppetDB server.
 type Store struct {
 	entities map[string][]Row
+	// path is the file this store is bound to (set by [Open]); Save persists
+	// to it. Empty for stores created with [NewStore].
+	path string
 }
 
 // NewStore returns an empty store.
