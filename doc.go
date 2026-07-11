@@ -37,11 +37,32 @@
 //     callers (and tests) can supply a fake, a TLS-configured transport or a
 //     token-authenticated one without touching the network.
 //
+//   - An AST-query parser, [ParseAST], the inverse of [Query.AST]: it reads
+//     PuppetDB's canonical ["from", ...] JSON back into a typed [Query], so the
+//     package can serve the AST query form as well as compile to it. For every
+//     query this package emits, re-compiling the parsed result reproduces the
+//     original AST byte-for-byte.
+//
+//   - Command ingestion, [Store.Ingest], for the current PuppetDB command wire
+//     formats — replace facts (v5), replace catalog (v9) and store report (v8).
+//     Each command is expanded into the query entities PuppetDB derives from it
+//     (facts, fact_contents, inventory, resources, edges, catalogs, reports,
+//     events and nodes), so ingested data is immediately queryable.
+//
+//   - A pure-Go embedded storage backend: [Open], [Store.Save], [Store.Snapshot]
+//     and [Load] persist a store to a JSON file with no external database.
+//
+//   - An HTTP [Server] that serves the query API at /pdb/query/v4 (the root
+//     PQL/AST endpoint and the per-entity paths) and ingests commands at
+//     /pdb/cmd/v1, backed by a [Store] and safe to serve concurrently.
+//
 // A handful of constructs parse and compile to the correct AST-query JSON (so
 // the [Client] sends them to a real PuppetDB) but are not evaluated in the
 // in-memory [Store], which reports a clear error instead: the to_string
 // transform (needs PostgreSQL to_char formatting) and implicit subqueries
-// (need PuppetDB's entity join graph). Out of scope (documented, not silently
-// capped): a PuppetDB storage server, command/ingest endpoints and importing a
-// live PuppetDB's data. See the package README for the full support matrix.
+// (need PuppetDB's entity join graph). Named residuals (documented, not
+// silently capped): older command wire-format versions, the latest_report_*
+// node rollups, PuppetDB-identical catalog/report content hashes (the store
+// uses deterministic SHA-1 content hashes instead), and the query-endpoint
+// pagination/count HTTP headers. See the package README for the full matrix.
 package puppetdb

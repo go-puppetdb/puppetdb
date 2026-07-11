@@ -7,8 +7,13 @@
 A pragmatic, **pure-Go (CGO=0), standard-library-only** PuppetDB toolkit:
 
 - a **PQL** (Puppet Query Language) lexer, parser and typed AST;
-- a compiler from the AST to PuppetDB's **canonical AST-query JSON** wire form;
+- a compiler from the AST to PuppetDB's **canonical AST-query JSON** wire form,
+  and `ParseAST` — the **inverse**, reading that JSON back into a query;
 - an **in-memory evaluator** so PQL is useful and fully testable without a server;
+- **command ingestion** for the current PuppetDB wire formats (replace facts v5,
+  replace catalog v9, store report v8), expanded into the derived query entities;
+- a pure-Go **embedded storage backend** (JSON file, no external database);
+- an **HTTP server** exposing `/pdb/query/v4` (PQL + AST) and `/pdb/cmd/v1`;
 - an **HTTP client** for a real PuppetDB `/pdb/query/v4` endpoint, behind an
   injectable `http.RoundTripper` seam.
 
@@ -29,6 +34,18 @@ c := puppetdb.NewClient("https://puppetdb.example:8081", puppetdb.WithToken(toke
 rows, _ = c.Query(context.Background(), `nodes{ facts.os.family = "RedHat" }`)
 ```
 
+Serve your own PuppetDB-compatible endpoint, backed by an embedded store:
+
+```go
+db, _ := puppetdb.Open("puppetdb.json")          // pure-Go, no database
+srv := puppetdb.NewServer(db)                     // /pdb/query/v4 + /pdb/cmd/v1
+http.ListenAndServe(":8081", srv)
+
+// Agents POST commands to /pdb/cmd/v1?command=replace_facts&version=5&certname=…
+// Clients POST PQL or AST to /pdb/query/v4; the ingested data is queryable at
+// once. Parse the AST wire form back into a Query with puppetdb.ParseAST.
+```
+
 ## Supported
 
 | Area | Detail |
@@ -47,6 +64,10 @@ rows, _ = c.Query(context.Background(), `nodes{ facts.os.family = "RedHat" }`)
 | Fields | dotted deep paths and a trailing `?` (e.g. `deactivated?`) |
 | Compilation | PQL → canonical AST-query JSON: `["from", entity, ["extract", [cols…], filter, ["group_by", …]], …]`, `["function", name, args…]`, `["~>", …]`, `["subquery", …]` |
 | Evaluation | in-memory store: filter, recursive `in`-subquery evaluation, `group by` + `count/avg/sum/min/max` aggregation, `~>` array matching, ordering, paging, projection |
+| AST parsing | `ParseAST` reads the canonical `["from", …]` JSON back into a `Query` (functions, `group_by`, `~>`, `subquery`, n-ary `and`/`or`); inverse of compilation, byte-exact round-trip |
+| Command ingestion | `Store.Ingest` for **replace facts** (v5), **replace catalog** (v9), **store report** (v8) → expands into `facts`/`fact_contents`/`inventory`/`resources`/`edges`/`catalogs`/`reports`/`events`/`nodes` |
+| Storage | pure-Go embedded backend: `Open`/`Save`/`Snapshot`/`Load` persist a store to a JSON file (atomic write, no external DB) |
+| Server | `Server` serves `GET`/`POST /pdb/query/v4` (PQL or AST) and per-entity `/pdb/query/v4/<entity>`, plus `POST /pdb/cmd/v1` command ingest returning a `{"uuid":…}`; concurrency-safe |
 | Client | POST PQL or compiled AST to `/pdb/query/v4`; token auth; injectable transport |
 
 The parser accepts every construct of PuppetDB's PQL grammar
@@ -65,12 +86,20 @@ than guessing:
   graph. Use the explicit `field in entity[field]{ ... }` form for in-memory
   evaluation.
 
-## Out of scope (documented — not silently capped)
+## Residuals (documented — not silently capped)
 
-- **A PuppetDB storage server.** This library queries; it does not persist,
-  index or serve. There is no on-disk store and no command/ingest endpoint.
-- **Importing a live PuppetDB's data** into the in-memory store (no sync/replay
-  helpers yet — you populate `Store` yourself).
+The server, command ingestion and embedded storage are implemented; the
+remaining PuppetDB-parity items are named explicitly:
+
+- **Older command wire-format versions.** `Ingest` implements the *current*
+  formats (facts v5, catalog v9, report v8); it rejects earlier versions rather
+  than guessing.
+- **PuppetDB-identical content hashes.** The store's `hash`/`resource` columns
+  are deterministic SHA-1 content hashes of the payload, not PuppetDB's own
+  catalog/report canonicalisation, so they will not match a PuppetDB instance
+  byte-for-byte.
+- **`latest_report_*` node rollups** beyond the fields set at ingest, and the
+  pagination/count HTTP response headers (`X-Records`) of the real query API.
 - **Regexp capture-group projections** — not a PQL construct (PQL projects
   fields and functions only), so nothing to implement.
 
