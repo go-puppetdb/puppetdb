@@ -208,7 +208,7 @@ func applyExtract(q *Query, arr []any) error {
 	return nil
 }
 
-// projItemsFromAST converts a decoded projection/group-by list into [ProjItem]s:
+// projItemsFromAST converts a decoded projection/group-by list into [ProjItem] values:
 // strings become plain fields, ["function", name, args...] nodes become
 // functions.
 func projItemsFromAST(vals []any) ([]ProjItem, error) {
@@ -230,7 +230,7 @@ func projItemsFromAST(vals []any) ([]ProjItem, error) {
 	return items, nil
 }
 
-// funcFromAST parses a ["function", name, arg...] node. Because [Func.compile]
+// funcFromAST parses a ["function", name, arg...] node. Because Func.compile
 // emits both field and string-literal arguments as plain strings, parsed
 // arguments are treated as fields; this preserves the compiled AST exactly.
 func funcFromAST(arr []any) (*Func, error) {
